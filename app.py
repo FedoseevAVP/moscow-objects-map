@@ -676,6 +676,35 @@ def nearest_metro(lat: float, lon: float, metro_df: pd.DataFrame) -> tuple[str, 
     return best_name, best_distance, best_lat, best_lon
 
 
+def is_mcd_3_or_4(line_name: Any) -> bool:
+    """Определяет две линии, которые сильнее всего растягивают схему."""
+    compact = re.sub(r"[\s–—_]", "", normalize_name(line_name))
+    return "мцд-3" in compact or "мцд3" in compact or "мцд-4" in compact or "мцд4" in compact
+
+
+def filter_metro_network(
+    metro_network: dict[str, Any],
+    include_mcd_3_4: bool,
+) -> dict[str, Any]:
+    """Скрывает МЦД-3/4, сохраняя пересадочные станции обычного метро."""
+    if include_mcd_3_4:
+        return metro_network
+
+    stations = metro_network["stations"].copy()
+
+    def station_has_regular_line(value: Any) -> bool:
+        line_names = [part.strip() for part in clean_text(value).split(" / ") if part.strip()]
+        return any(not is_mcd_3_or_4(line_name) for line_name in line_names)
+
+    stations = stations[stations["Линия"].map(station_has_regular_line)].copy()
+    segments = [
+        segment
+        for segment in metro_network.get("segments", [])
+        if not is_mcd_3_or_4(segment.get("line", ""))
+    ]
+    return {"stations": stations, "segments": segments}
+
+
 @st.cache_data(show_spinner=False)
 def add_nearest_metro(objects: pd.DataFrame, metro_df: pd.DataFrame) -> pd.DataFrame:
     result = objects.copy()
@@ -1013,9 +1042,11 @@ if objects_valid.empty:
     st.stop()
 
 metro_error: str | None = None
+show_mcd_3_4 = bool(st.session_state.get("show_mcd_3_4", False))
 try:
     with st.spinner("Обновляем схему метро…"):
-        metro_network = load_metro_network()
+        full_metro_network = load_metro_network()
+    metro_network = filter_metro_network(full_metro_network, show_mcd_3_4)
     metro_df = metro_network["stations"]
     objects_valid = add_nearest_metro(objects_valid, metro_df)
 except Exception as error:
@@ -1053,6 +1084,12 @@ st.sidebar.divider()
 show_metro = st.sidebar.checkbox("Показывать ближайшее метро", value=True)
 show_lines = st.sidebar.checkbox(
     "Линии от объектов до метро", value=False, disabled=not show_metro
+)
+show_mcd_3_4 = st.sidebar.checkbox(
+    "Показывать МЦД-3 и МЦД-4",
+    value=False,
+    key="show_mcd_3_4",
+    help="По умолчанию скрыты, чтобы длинные диаметры не уменьшали масштаб схемы метро.",
 )
 show_table = st.sidebar.checkbox("Таблица под картой", value=False)
 
@@ -1214,7 +1251,12 @@ else:
         st.info("Схема метро сейчас недоступна. Переключитесь на карту Москвы.")
     else:
         st.caption(
-            "Красные маркеры показывают количество объектов у станции. Нажмите на маркер, чтобы увидеть список."
+            "Красные маркеры показывают количество объектов у станции. Нажмите на маркер, чтобы увидеть список. "
+            + (
+                "МЦД-3 и МЦД-4 включены."
+                if show_mcd_3_4
+                else "МЦД-3 и МЦД-4 скрыты для компактного масштаба."
+            )
         )
         metro_map = build_metro_map(filtered, metro_network, address_result)
         st_folium(metro_map, height=720, use_container_width=True, returned_objects=[])
