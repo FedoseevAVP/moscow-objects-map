@@ -5,11 +5,13 @@ import math
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import folium
 import pandas as pd
 import requests
 import streamlit as st
+from branca.element import MacroElement, Template
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 
@@ -26,6 +28,7 @@ DEFAULT_CENTER = [55.751244, 37.618423]
 DEFAULT_ZOOM = 10
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+DGIS_GEOCODER_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving"
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving"
 OVERPASS_URLS = [
@@ -217,6 +220,32 @@ def clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def get_2gis_api_key() -> str:
+    """Ключ хранится в Streamlit Secrets и никогда не записывается в Excel."""
+    try:
+        return clean_text(st.secrets.get("DGIS_API_KEY", ""))
+    except Exception:
+        return ""
+
+
+class PlainLeafletAttribution(MacroElement):
+    """Keep map and tile-provider attribution, without Leaflet's default flag."""
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        {{ this._parent.get_name() }}.attributionControl.setPrefix(
+            '<a href="https://leafletjs.com" target="_blank" rel="noopener noreferrer">Leaflet</a>'
+        );
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self):
+        super().__init__()
+        self._name = "PlainLeafletAttribution"
+
+
 def normalize_name(value: Any) -> str:
     return (
         clean_text(value)
@@ -309,10 +338,48 @@ def load_objects(file_mtime: float) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def geocode_address(address: str) -> dict[str, Any] | None:
+def geocode_address(address: str, dgis_api_key: str = "") -> dict[str, Any] | None:
     query = address.strip()
     if not query:
         return None
+
+    # Основной источник — 2ГИС. Он ищет именно здания и возвращает
+    # актуальную карточку объекта, назначение и точные координаты.
+    if dgis_api_key:
+        try:
+            response = requests.get(
+                DGIS_GEOCODER_URL,
+                params={
+                    "q": query,
+                    "fields": "items.point,items.geometry.centroid,items.address",
+                    "locale": "ru_RU",
+                    "page_size": 5,
+                    "key": dgis_api_key,
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=18,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            items = payload.get("result", {}).get("items", [])
+            with_coordinates = [item for item in items if item.get("point")]
+            building = next(
+                (item for item in with_coordinates if item.get("type") == "building"),
+                with_coordinates[0] if with_coordinates else None,
+            )
+            if building:
+                point = building["point"]
+                return {
+                    "lat": float(point["lat"]),
+                    "lon": float(point["lon"]),
+                    "display_name": building.get("full_name") or building.get("name") or address,
+                    "provider": "2ГИС",
+                    "building_id": clean_text(building.get("id")),
+                    "building_type": clean_text(building.get("purpose_name")),
+                }
+        except Exception:
+            # При временной ошибке 2ГИС сайт продолжит работу через резервный поиск.
+            pass
 
     variants = [query]
     if "москв" not in query.lower():
@@ -339,6 +406,9 @@ def geocode_address(address: str) -> dict[str, Any] | None:
                 "lat": float(item["lat"]),
                 "lon": float(item["lon"]),
                 "display_name": item.get("display_name", address),
+                "provider": "OpenStreetMap — резерв",
+                "building_id": "",
+                "building_type": "",
             }
     return None
 
@@ -785,6 +855,7 @@ def build_city_map(
     show_metro: bool,
     show_lines: bool,
     address_result: dict[str, Any] | None,
+    dgis_api_key: str,
 ) -> folium.Map:
     if address_result:
         map_center = [address_result["lat"], address_result["lon"]]
@@ -793,12 +864,33 @@ def build_city_map(
         map_center = [float(filtered["Широта"].mean()), float(filtered["Долгота"].mean())]
         zoom = DEFAULT_ZOOM
 
-    map_object = folium.Map(
-        location=map_center,
-        zoom_start=zoom,
-        tiles="OpenStreetMap",
-        control_scale=True,
-    )
+    if dgis_api_key:
+        map_object = folium.Map(
+            location=map_center,
+            zoom_start=zoom,
+            tiles=None,
+            control_scale=True,
+        )
+        encoded_key = quote(dgis_api_key, safe="")
+        folium.TileLayer(
+            tiles=(
+                "https://tile0.maps.2gis.com/v2/tiles/online_hd/"
+                "{z}/{x}/{y}.png?key=" + encoded_key
+            ),
+            attr="© 2ГИС",
+            name="2ГИС — актуальные здания",
+            overlay=False,
+            control=False,
+            max_native_zoom=19,
+            max_zoom=20,
+        ).add_to(map_object)
+    else:
+        map_object = folium.Map(
+            location=map_center,
+            zoom_start=zoom,
+            tiles="OpenStreetMap",
+            control_scale=True,
+        )
     cluster = MarkerCluster(name="Объекты").add_to(map_object)
     metro_added: set[tuple[str, float, float]] = set()
 
@@ -879,6 +971,7 @@ def build_city_map(
             ).add_to(map_object)
 
     folium.LayerControl(collapsed=True).add_to(map_object)
+    PlainLeafletAttribution().add_to(map_object)
     return map_object
 
 
@@ -985,6 +1078,7 @@ def build_metro_map(
             ],
             padding=(18, 18),
         )
+    PlainLeafletAttribution().add_to(map_object)
     return map_object
 
 
@@ -1008,6 +1102,8 @@ with header_text:
         """,
         unsafe_allow_html=True,
     )
+
+dgis_api_key = get_2gis_api_key()
 
 
 # =========================================================
@@ -1068,6 +1164,11 @@ except Exception as error:
 
 
 st.sidebar.markdown("### Фильтры")
+st.sidebar.caption(
+    "Карта: 2ГИС · актуальные здания"
+    if dgis_api_key
+    else "Карта: OpenStreetMap · резервный режим"
+)
 search_text = st.sidebar.text_input(
     "Поиск по базе", placeholder="Объект, адрес, ответственный…"
 ).strip()
@@ -1157,7 +1258,7 @@ if check_address:
     else:
         try:
             with st.spinner("Ищем адрес и рассчитываем логистику…"):
-                geocoded = geocode_address(new_address)
+                geocoded = geocode_address(new_address, dgis_api_key)
                 if not geocoded:
                     raise ValueError("Адрес не найден. Уточните город, улицу и номер дома.")
                 logistics = evaluate_logistics(
@@ -1193,6 +1294,7 @@ if address_result:
             <div>{html.escape(logistics['reason'])}</div>
             <div class="metric-note" style="margin-top:8px">
                 Найдено: {html.escape(address_result['display_name'])}
+                · источник: {html.escape(address_result.get('provider', ''))}
             </div>
         </div>
         """,
@@ -1244,7 +1346,16 @@ view_mode = st.radio(
 )
 
 if view_mode == "Карта Москвы":
-    city_map = build_city_map(filtered, show_metro, show_lines, address_result)
+    if not dgis_api_key:
+        st.warning(
+            "На этом экране работает резервная карта OpenStreetMap: приложение не видит ключ 2ГИС. "
+            "Проверьте в Streamlit Community Cloud → Settings → Secrets запись "
+            "DGIS_API_KEY = \"...\", сохраните настройки и перезапустите приложение. "
+            "Ключ в GitHub или в файле secrets.toml.example не подключает карту."
+        )
+    city_map = build_city_map(
+        filtered, show_metro, show_lines, address_result, dgis_api_key
+    )
     st_folium(city_map, height=690, use_container_width=True, returned_objects=[])
 else:
     if metro_df.empty:
