@@ -236,9 +236,11 @@ class PlainLeafletAttribution(MacroElement):
     _template = Template(
         """
         {% macro script(this, kwargs) %}
-        {{ this._parent.get_name() }}.attributionControl.setPrefix(
-            '<a href="https://leafletjs.com" target="_blank" rel="noopener noreferrer">Leaflet</a>'
-        );
+        if ({{ this._parent.get_name() }}.attributionControl) {
+            {{ this._parent.get_name() }}.attributionControl.setPrefix(
+                '<a href="https://leafletjs.com" target="_blank" rel="noopener noreferrer">Leaflet</a>'
+            );
+        }
         {% endmacro %}
         """
     )
@@ -680,7 +682,11 @@ def load_metro_network() -> dict[str, Any]:
     try:
         response = requests.get(
             HH_METRO_URL,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "ru"},
+            headers={
+                "User-Agent": USER_AGENT,
+                "HH-User-Agent": USER_AGENT,
+                "Accept-Language": "ru",
+            },
             timeout=18,
         )
         response.raise_for_status()
@@ -1087,7 +1093,7 @@ def build_metro_map(
         tiles=None,
         control_scale=False,
         zoom_control=True,
-        attribution_control=False,
+        attribution_control=True,
     )
 
     for segment in metro_network.get("segments", []):
