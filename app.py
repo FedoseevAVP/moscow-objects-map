@@ -31,6 +31,8 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 DGIS_GEOCODER_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving"
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving"
+DGIS_ROUTING_URL = "https://routing.api.2gis.com/routing/7.0.0/global"
+DGIS_TRANSIT_URL = "https://routing.api.2gis.com/public_transport/2.0"
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -476,6 +478,90 @@ def road_route(
     return [[float(lat), float(lon)] for lon, lat in coordinates]
 
 
+def wkt_line(value: str) -> list[list[float]]:
+    match = re.fullmatch(r"LINESTRING\s*\((.+)\)", value.strip(), re.IGNORECASE)
+    if not match:
+        return []
+    try:
+        points = []
+        for pair in match.group(1).split(","):
+            lon, lat = map(float, pair.strip().split()[:2])
+            points.append([lat, lon])
+        return points if len(points) >= 2 else []
+    except (ValueError, IndexError):
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def dgis_route(
+    origin_lat: float,
+    origin_lon: float,
+    destination_lat: float,
+    destination_lon: float,
+    travel_mode: str,
+    api_key: str,
+) -> dict[str, Any] | None:
+    if not api_key:
+        return None
+
+    if travel_mode == "Общественный транспорт":
+        url = DGIS_TRANSIT_URL
+        body = {
+            "source": {"point": {"lat": origin_lat, "lon": origin_lon}},
+            "target": {"point": {"lat": destination_lat, "lon": destination_lon}},
+            "transport": ["pedestrian", "metro", "light_metro", "mcc", "mcd",
+                          "suburban_train", "tram", "bus", "trolleybus", "shuttle_bus"],
+            "locale": "ru",
+        }
+    else:
+        url = DGIS_ROUTING_URL
+        point_type = "walking" if travel_mode == "Пешком" else "stop"
+        body = {
+            "points": [
+                {"type": point_type, "lon": origin_lon, "lat": origin_lat},
+                {"type": point_type, "lon": destination_lon, "lat": destination_lat},
+            ],
+            "transport": "walking" if travel_mode == "Пешком" else "driving",
+            "route_mode": "fastest",
+            "output": "detailed",
+            "locale": "ru",
+        }
+
+    response = requests.post(url, params={"key": api_key}, json=body, timeout=18)
+    response.raise_for_status()
+    payload = response.json()
+    variants = payload if isinstance(payload, list) else payload.get("result", [])
+    if not isinstance(variants, list):
+        return None
+    variants = [
+        item for item in variants
+        if isinstance(item, dict) and item.get("total_duration") is not None
+        and (travel_mode != "Общественный транспорт" or not item.get("pedestrian"))
+    ]
+    if not variants:
+        return None
+    route = min(variants, key=lambda item: item["total_duration"])
+    selections = []
+    if travel_mode == "Общественный транспорт":
+        for movement in route.get("movements", []):
+            alternatives = movement.get("alternatives") or []
+            if alternatives:
+                selections.extend(part.get("selection", "") for part in alternatives[0].get("geometry", []))
+    else:
+        for end in ("begin_pedestrian_path", "end_pedestrian_path"):
+            selections.append((route.get(end) or {}).get("geometry", {}).get("selection", ""))
+        for maneuver in route.get("maneuvers", []):
+            selections.extend(part.get("selection", "") for part in
+                              (maneuver.get("outcoming_path") or {}).get("geometry", []))
+    return {
+        "minutes": float(route["total_duration"]) / 60,
+        "road_km": float(route["total_distance"]) / 1000,
+        "segments": [line for selection in selections if (line := wkt_line(selection))],
+        "provider": "2ГИС",
+        "transfers": route.get("transfer_count") if travel_mode == "Общественный транспорт" else None,
+    }
+
+
 def evaluate_logistics(
     lat: float,
     lon: float,
@@ -483,6 +569,8 @@ def evaluate_logistics(
     good_minutes: int,
     acceptable_minutes: int,
     density_radius_km: int,
+    travel_mode: str,
+    dgis_api_key: str,
 ) -> dict[str, Any]:
     candidates = objects[service_object_mask(objects)].copy()
     if candidates.empty:
@@ -494,31 +582,49 @@ def evaluate_logistics(
     )
     candidates = candidates.sort_values("air_km")
     nearby_count = int((candidates["air_km"] <= density_radius_km).sum())
-    route_candidates = candidates.head(8).copy()
-    routing_ok = False
+    route_candidates = candidates.head(5 if dgis_api_key else 8).copy()
+    nearest = route_candidates.iloc[0]
+    selected_route = None
+    if dgis_api_key:
+        routes = []
+        for _, candidate in route_candidates.iterrows():
+            try:
+                route = dgis_route(
+                    lat, lon, float(candidate["Широта"]), float(candidate["Долгота"]),
+                    travel_mode, dgis_api_key,
+                )
+                if route:
+                    routes.append((candidate, route))
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                continue
+        if routes:
+            nearest, selected_route = min(routes, key=lambda item: item[1]["minutes"])
 
-    try:
-        destinations = tuple(
-            (float(row["Широта"]), float(row["Долгота"]))
-            for _, row in route_candidates.iterrows()
-        )
-        routes = road_table(lat, lon, destinations)
-        if len(routes) == len(route_candidates):
-            route_candidates["road_km"] = [item["road_km"] for item in routes]
-            route_candidates["minutes"] = [item["minutes"] for item in routes]
-            available = route_candidates.dropna(subset=["minutes"])
-            if not available.empty:
-                nearest = available.sort_values("minutes").iloc[0]
-                routing_ok = True
-            else:
-                nearest = route_candidates.iloc[0]
-        else:
-            nearest = route_candidates.iloc[0]
-    except Exception:
-        nearest = route_candidates.iloc[0]
+    if selected_route is None and travel_mode == "На машине":
+        try:
+            destinations = tuple(
+                (float(row["Широта"]), float(row["Долгота"]))
+                for _, row in route_candidates.iterrows()
+            )
+            routes = road_table(lat, lon, destinations)
+            available = [(candidate, route) for (_, candidate), route in zip(
+                route_candidates.iterrows(), routes
+            ) if route["minutes"] is not None]
+            if available:
+                nearest, selected_route = min(available, key=lambda item: item[1]["minutes"])
+                selected_route = {**selected_route, "provider": "OSRM", "segments": []}
+                try:
+                    selected_route["segments"] = [road_route(
+                        lat, lon, float(nearest["Широта"]), float(nearest["Долгота"])
+                    )]
+                except (requests.RequestException, ValueError, KeyError, IndexError):
+                    pass
+        except (requests.RequestException, ValueError, KeyError, IndexError):
+            pass
 
-    minutes = float(nearest["minutes"]) if routing_ok else None
-    road_km = float(nearest["road_km"]) if routing_ok else None
+    routing_ok = selected_route is not None
+    minutes = selected_route["minutes"] if routing_ok else None
+    road_km = selected_route["road_km"] if routing_ok else None
     air_km = float(nearest["air_km"])
 
     if routing_ok:
@@ -535,15 +641,11 @@ def evaluate_logistics(
             title = "Нужна отдельная оценка"
             reason = "До ближайшего объекта далеко; желательно объединить выезд с другими работами."
     else:
-        good_km = max(5.0, good_minutes * 0.35)
-        acceptable_km = max(12.0, acceptable_minutes * 0.35)
-        if air_km <= good_km or nearby_count >= 3:
-            level, title = "good", "Логистически удобно"
-        elif air_km <= acceptable_km or nearby_count >= 2:
-            level, title = "medium", "Можно рассматривать"
-        else:
-            level, title = "review", "Нужна отдельная оценка"
-        reason = "Маршрутный сервис недоступен: предварительная оценка выполнена по расстоянию по прямой."
+        level, title = "review", "Маршрут недоступен"
+        reason = (
+            "Для выбранного способа передвижения нет маршрута. Проверьте доступ к Routing API 2ГИС "
+            "для этого ключа либо выберите другой способ. Показано лишь расстояние по прямой."
+        )
 
     return {
         "level": level,
@@ -558,6 +660,10 @@ def evaluate_logistics(
         "minutes": minutes,
         "nearby_count": nearby_count,
         "routing_ok": routing_ok,
+        "travel_mode": travel_mode,
+        "route_provider": selected_route["provider"] if routing_ok else "",
+        "route_segments": selected_route["segments"] if routing_ok else [],
+        "transfers": selected_route.get("transfers") if routing_ok else None,
     }
 
 
@@ -946,28 +1052,22 @@ def build_city_map(
             icon=folium.Icon(color="cadetblue", icon="search", prefix="fa"),
         ).add_to(map_object)
 
-        try:
-            route = road_route(
-                lat,
-                lon,
-                logistics["nearest_lat"],
-                logistics["nearest_lon"],
-            )
+        for route in logistics["route_segments"]:
             folium.PolyLine(
                 route,
                 color=BRAND_RED,
                 weight=5,
                 opacity=0.82,
-                tooltip="Маршрут до ближайшего объекта",
+                tooltip=f"{logistics['travel_mode']} · маршрут до ближайшего объекта",
             ).add_to(map_object)
-        except Exception:
+        if not logistics["route_segments"]:
             folium.PolyLine(
                 [[lat, lon], [logistics["nearest_lat"], logistics["nearest_lon"]]],
                 color=BRAND_RED,
                 weight=3,
                 opacity=0.72,
                 dash_array="7,8",
-                tooltip="Направление до ближайшего объекта",
+                tooltip="Направление до ближайшего объекта — маршрут не получен",
             ).add_to(map_object)
 
     folium.LayerControl(collapsed=True).add_to(map_object)
@@ -1242,6 +1342,11 @@ st.caption(
 )
 
 with st.form("address_check", clear_on_submit=False):
+    travel_mode = st.radio(
+        "Способ передвижения",
+        ["На машине", "Пешком", "Общественный транспорт"],
+        horizontal=True,
+    )
     address_col, button_col = st.columns([5, 1], vertical_alignment="bottom")
     with address_col:
         new_address = st.text_input(
@@ -1268,6 +1373,8 @@ if check_address:
                     int(good_minutes),
                     int(acceptable_minutes),
                     int(density_radius_km),
+                    travel_mode,
+                    dgis_api_key,
                 )
                 st.session_state["address_result"] = {**geocoded, "logistics": logistics}
         except Exception as error:
@@ -1303,7 +1410,7 @@ if address_result:
 
     result_col1, result_col2, result_col3, result_col4 = st.columns(4)
     result_col1.metric("Ближайший объект", logistics["nearest_name"])
-    result_col2.metric("Время в пути", minutes_text)
+    result_col2.metric("Время · " + logistics["travel_mode"].lower(), minutes_text)
     result_col3.metric("Расстояние", distance_text)
     result_col4.metric(
         f"Объектов в радиусе {int(density_radius_km)} км", logistics["nearby_count"]
@@ -1311,7 +1418,9 @@ if address_result:
     st.caption(
         "Ближайший объект: "
         + logistics["nearest_address"]
-        + ". Оценка не учитывает пробки, график инженеров и состав работ."
+        + (". Маршрут: " + logistics["route_provider"] if logistics["routing_ok"] else "")
+        + (f" · пересадок: {logistics['transfers']}" if logistics["transfers"] is not None else "")
+        + ". Оценка не учитывает график инженеров и состав работ."
     )
 
 
